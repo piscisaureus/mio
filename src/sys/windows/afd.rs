@@ -4,7 +4,6 @@ use std::fs::File;
 use std::io;
 use std::mem::{size_of, zeroed};
 use std::ptr::null_mut;
-use std::sync::atomic::{AtomicUsize, Ordering};
 
 use miow::iocp::CompletionPort;
 
@@ -26,8 +25,6 @@ use ntapi::ntioapi::{NtCancelIoFileEx, NtCreateFile, NtDeviceIoControlFile};
 use ntapi::ntrtl::RtlNtStatusToDosError;
 
 const IOCTL_AFD_POLL: ULONG = 0x00012024;
-
-static NEXT_TOKEN: AtomicUsize = AtomicUsize::new(0);
 
 lazy_static! {
     static ref AFD_HELPER_NAME: Vec<u16> = {
@@ -105,7 +102,7 @@ impl fmt::Debug for AfdPollInfo {
 
 impl Afd {
     /// Create new Afd instance.
-    pub fn new(cp: &CompletionPort) -> io::Result<Afd> {
+    pub fn new(cp: &CompletionPort, key: usize) -> io::Result<Afd> {
         let mut afd_helper_handle: HANDLE = INVALID_HANDLE_VALUE;
         let mut iosb = IO_STATUS_BLOCK {
             u: IO_STATUS_BLOCK_u { Status: 0 },
@@ -133,8 +130,7 @@ impl Afd {
             }
             let fd = File::from_raw_handle(afd_helper_handle as RawHandle);
             let afd = Afd { fd };
-            let token = NEXT_TOKEN.fetch_add(1, Ordering::Relaxed) + 1;
-            cp.add_handle(token, &afd.fd)?;
+            cp.add_handle(key, &afd.fd)?;
             match SetFileCompletionNotificationModes(
                 afd_helper_handle,
                 FILE_SKIP_SET_EVENT_ON_HANDLE,

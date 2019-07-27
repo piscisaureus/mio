@@ -1,6 +1,7 @@
 use std::sync::{Arc, Mutex};
 
 mod afd;
+pub mod completion_handler;
 pub mod event;
 mod io_status_block;
 mod selector;

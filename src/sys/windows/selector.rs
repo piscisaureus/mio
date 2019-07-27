@@ -13,6 +13,7 @@ use winapi::shared::ntdef::NT_SUCCESS;
 use winapi::shared::ntdef::{HANDLE, PVOID};
 use winapi::shared::ntstatus::STATUS_CANCELLED;
 use winapi::shared::winerror::{ERROR_INVALID_HANDLE, ERROR_IO_PENDING};
+use winapi::um::minwinbase::OVERLAPPED_ENTRY;
 use winapi::um::mswsock::SIO_BASE_HANDLE;
 use winapi::um::winsock2::{WSAIoctl, INVALID_SOCKET, SOCKET_ERROR};
 
@@ -27,6 +28,7 @@ use super::afd::{
     AFD_POLL_LOCAL_CLOSE, AFD_POLL_RECEIVE, AFD_POLL_RECEIVE_EXPEDITED, AFD_POLL_SEND,
     KNOWN_AFD_EVENTS,
 };
+use super::completion_handler;
 use super::io_status_block::IoStatusBlock;
 use super::Event;
 use super::SocketState;
@@ -45,6 +47,7 @@ pub struct SockState {
     iosb: Pin<Box<IoStatusBlock>>,
     poll_info: AfdPollInfo,
     afd: Arc<Afd>,
+    selector: Arc<SockSelector>,
     raw_socket: RawSocket,
     base_socket: RawSocket,
     user_evts: u32,
@@ -55,11 +58,16 @@ pub struct SockState {
 }
 
 impl SockState {
-    fn new(raw_socket: RawSocket, afd: Arc<Afd>) -> io::Result<SockState> {
+    fn new(
+        raw_socket: RawSocket,
+        afd: Arc<Afd>,
+        selector: Arc<SockSelector>,
+    ) -> io::Result<SockState> {
         Ok(SockState {
             iosb: Pin::new(Box::new(IoStatusBlock::zeroed())),
             poll_info: AfdPollInfo::zeroed(),
             afd,
+            selector,
             raw_socket,
             base_socket: get_base_socket(raw_socket)?,
             user_evts: 0,
@@ -245,6 +253,7 @@ impl Selector {
             }
         })
     }
+
     pub fn select(&self, events: &mut Events, timeout: Option<Duration>) -> io::Result<()> {
         self.inner.select(events, timeout)
     }
@@ -255,7 +264,9 @@ impl Selector {
         token: Token,
         interests: Interests,
     ) -> io::Result<()> {
-        self.inner.register(socket, token, interests)
+        let sock_selector = self.inner.sock_selector();
+        let port = self.inner.port();
+        sock_selector.register(socket, token, interests, &port)
     }
 
     pub fn reregister<S: SocketState>(
@@ -264,11 +275,13 @@ impl Selector {
         token: Token,
         interests: Interests,
     ) -> io::Result<()> {
-        self.inner.reregister(socket, token, interests)
+        self.inner
+            .sock_selector()
+            .reregister(socket, token, interests)
     }
 
     pub fn deregister<S: SocketState>(&self, socket: &S) -> io::Result<()> {
-        self.inner.deregister(socket)
+        self.inner.sock_selector().deregister(socket)
     }
 
     #[cfg(debug_assertions)]
@@ -288,31 +301,40 @@ impl Selector {
 #[derive(Debug)]
 pub struct SelectorInner {
     cp: CompletionPort,
-    active_poll_count: AtomicUsize,
-    update_queue: Mutex<VecDeque<Arc<Mutex<SockState>>>>,
-    afd_group: Mutex<Vec<Arc<Afd>>>,
+    sock_selector: Arc<SockSelector>,
 }
 
 impl SelectorInner {
     pub fn new() -> io::Result<SelectorInner> {
         CompletionPort::new(0).map(|cp| SelectorInner {
             cp: cp,
-            active_poll_count: AtomicUsize::new(0),
-            update_queue: Mutex::new(VecDeque::new()),
-            afd_group: Mutex::new(Vec::new()),
+            sock_selector: Arc::new(SockSelector::new()),
         })
+    }
+
+    pub fn port(&self) -> &CompletionPort {
+        &self.cp
+    }
+
+    pub fn sock_selector(&self) -> Arc<SockSelector> {
+        self.sock_selector.clone()
+    }
+
+    // TODO: this should be a SockSelector method.
+    pub fn mark_delete_socket(&self, sock_state: &mut SockState) {
+        sock_state.mark_delete();
     }
 
     pub fn select(&self, events: &mut Events, timeout: Option<Duration>) -> io::Result<()> {
         events.clear();
 
-        self.update_sockets_events()?;
-
-        self.active_poll_count.fetch_add(1, Ordering::SeqCst);
+        // TODO: make a before-poll hook available to external handlers.
+        self.sock_selector.notify_poll_start()?;
 
         let result = self.cp.get_many(&mut events.statuses, timeout);
 
-        self.active_poll_count.fetch_sub(1, Ordering::SeqCst);
+        // TODO: make after-poll notification available to external handlers.
+        self.sock_selector.notify_poll_end()?;
 
         if let Err(e) = result {
             use winapi::shared::winerror::WAIT_TIMEOUT;
@@ -322,15 +344,40 @@ impl SelectorInner {
             return Err(e);
         }
 
-        self.feed_events(&mut events.events, result.unwrap());
+        for completion in result.unwrap().iter().map(CompletionStatus::entry) {
+            let handler = unsafe { completion_handler::from_key(completion.lpCompletionKey) };
+            match handler(&completion) {
+                Some(e) => events.events.push(e),
+                None => {}
+            };
+        }
+
         Ok(())
+    }
+}
+
+#[derive(Debug)]
+pub struct SockSelector {
+    active_poll_count: AtomicUsize,
+    update_queue: Mutex<VecDeque<Arc<Mutex<SockState>>>>,
+    afd_group: Mutex<Vec<Arc<Afd>>>,
+}
+
+impl SockSelector {
+    pub fn new() -> Self {
+        Self {
+            active_poll_count: AtomicUsize::new(0),
+            update_queue: Mutex::new(VecDeque::new()),
+            afd_group: Mutex::new(Vec::new()),
+        }
     }
 
     pub fn register<S: SocketState + AsRawSocket>(
-        &self,
+        self: Arc<Self>,
         socket: &S,
         token: Token,
         interests: Interests,
+        cp: &CompletionPort,
     ) -> io::Result<()> {
         if socket.get_sock_state().is_some() {
             return Err(io::Error::from(io::ErrorKind::AlreadyExists));
@@ -338,7 +385,9 @@ impl SelectorInner {
 
         let flags = interests_to_afd_flags(interests);
 
-        let sock = self._alloc_sock_for_rawsocket(socket.as_raw_socket())?;
+        let sock = self
+            .clone()
+            ._alloc_sock_for_rawsocket(socket.as_raw_socket(), cp)?;
         let event = Event {
             flags,
             data: token.0 as u64,
@@ -389,14 +438,6 @@ impl SelectorInner {
         Ok(())
     }
 
-    pub fn port(&self) -> &CompletionPort {
-        &self.cp
-    }
-
-    pub fn mark_delete_socket(&self, sock_state: &mut SockState) {
-        sock_state.mark_delete();
-    }
-
     fn update_sockets_events(&self) -> io::Result<()> {
         {
             let mut update_queue = self.update_queue.lock().unwrap();
@@ -422,35 +463,29 @@ impl SelectorInner {
         Ok(())
     }
 
-    fn feed_events(&self, events: &mut Vec<Event>, iocp_events: &[CompletionStatus]) {
-        {
-            let mut update_queue = self.update_queue.lock().unwrap();
-            for iocp_event in iocp_events.iter() {
-                if iocp_event.overlapped() as usize == 0 {
-                    events.push(Event {
-                        flags: AFD_POLL_RECEIVE,
-                        data: iocp_event.token() as u64,
-                    });
-                    continue;
-                }
-                let sock =
-                    unsafe { Arc::from_raw(iocp_event.overlapped() as *mut Mutex<SockState>) };
-                let mut sock_guard = sock.lock().unwrap();
-                match sock_guard.feed_event() {
-                    Some(e) => {
-                        events.push(e);
-                    }
-                    None => {}
-                }
-                if !sock_guard.is_pending_deletion() {
-                    update_queue.push_back(sock.clone());
-                }
-            }
-        }
-        self._release_unused_afd();
+    pub fn notify_poll_start(&self) -> io::Result<()> {
+        self.active_poll_count.fetch_add(1, Ordering::SeqCst);
+        self.update_sockets_events()
     }
 
-    fn _acquire_afd(&self) -> io::Result<Arc<Afd>> {
+    pub fn notify_poll_end(&self) -> io::Result<()> {
+        self.active_poll_count.fetch_sub(1, Ordering::SeqCst);
+        Ok(())
+    }
+
+    fn handle_completion(completion: &OVERLAPPED_ENTRY) -> Option<Event> {
+        let sock = unsafe { Arc::from_raw(completion.lpOverlapped as *mut Mutex<SockState>) };
+        let mut sock_guard = sock.lock().unwrap();
+        let event = sock_guard.feed_event();
+        if !sock_guard.is_pending_deletion() {
+            let mut update_queue = sock_guard.selector.update_queue.lock().unwrap();
+            update_queue.push_back(sock.clone());
+        }
+        sock_guard.selector._release_unused_afd();
+        event
+    }
+
+    fn _acquire_afd(&self, cp: &CompletionPort) -> io::Result<Arc<Afd>> {
         let mut need_alloc = false;
         {
             let afd_group = self.afd_group.lock().unwrap();
@@ -464,7 +499,7 @@ impl SelectorInner {
             }
         }
         if need_alloc {
-            self._alloc_afd_group()?;
+            self._alloc_afd_group(cp)?;
         }
         match self.afd_group.lock().unwrap().last() {
             Some(rc) => Ok(rc.clone()),
@@ -477,21 +512,24 @@ impl SelectorInner {
         afd_group.retain(|g| Arc::strong_count(&g) > 1);
     }
 
-    fn _alloc_afd_group(&self) -> io::Result<()> {
+    fn _alloc_afd_group(&self, cp: &CompletionPort) -> io::Result<()> {
         let mut afd_group = self.afd_group.lock().unwrap();
-        let afd = Afd::new(&self.cp)?;
+        let key = completion_handler::as_key(Self::handle_completion);
+        let afd = Afd::new(cp, key)?;
         let rc = Arc::new(afd);
         afd_group.push(rc);
         Ok(())
     }
 
     fn _alloc_sock_for_rawsocket(
-        &self,
+        self: Arc<Self>,
         raw_socket: RawSocket,
+        cp: &CompletionPort,
     ) -> io::Result<Arc<Mutex<SockState>>> {
         Ok(Arc::new(Mutex::new(SockState::new(
             raw_socket,
-            self._acquire_afd()?,
+            self._acquire_afd(cp)?,
+            self.clone(),
         )?)))
     }
 
