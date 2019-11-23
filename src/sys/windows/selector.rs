@@ -391,6 +391,20 @@ pub struct SelectorInner {
 // We have ensured thread safety by introducing lock manually.
 unsafe impl Sync for SelectorInner {}
 
+impl Drop for SelectorInner {
+    fn drop(&mut self) {
+        loop {
+            let mut events = Events::with_capacity(1024);
+            let _ = self.select(&mut events, Some(std::time::Duration::from_millis(0)));
+            if events.events.len() < 1024 {
+                break;
+            }
+        }
+
+        self.afd_group.release_unused_afd();
+    }
+}
+
 impl SelectorInner {
     pub fn new() -> io::Result<SelectorInner> {
         CompletionPort::new(0).map(|cp| {
